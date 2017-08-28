@@ -4,9 +4,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/libkv"
-	"github.com/docker/libkv/store"
 	zk "github.com/samuel/go-zookeeper/zk"
+	"github.com/serverless/libkv"
+	"github.com/serverless/libkv/store"
 )
 
 const (
