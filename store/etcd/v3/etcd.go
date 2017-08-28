@@ -10,7 +10,7 @@ import (
 	etcd "github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/clientv3/concurrency"
 	"github.com/docker/libkv"
-	"github.com/docker/libkv/store"
+	"github.com/serverless/libkv/store"
 )
 
 const (
