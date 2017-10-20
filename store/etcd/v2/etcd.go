@@ -17,6 +17,10 @@ import (
 	"github.com/serverless/libkv/store"
 )
 
+const (
+	lockSuffix = "___lock"
+)
+
 var (
 	// ErrAbortTryLock is thrown when a user stops trying to seek the lock
 	// by sending a signal to the stop chan, this is used to verify if the
@@ -155,9 +159,14 @@ func keyNotFound(err error) bool {
 
 // Get the value at "key", returns the last modified
 // index to use in conjunction to Atomic calls
-func (s *Etcd) Get(key string) (pair *store.KVPair, err error) {
+func (s *Etcd) Get(key string, opts *store.ReadOptions) (pair *store.KVPair, err error) {
 	getOpts := &etcd.GetOptions{
 		Quorum: true,
+	}
+
+	// Get options
+	if opts != nil {
+		getOpts.Quorum = opts.Consistent
 	}
 
 	result, err := s.client.Get(context.Background(), s.normalize(key), getOpts)
@@ -205,8 +214,8 @@ func (s *Etcd) Delete(key string) error {
 }
 
 // Exists checks if the key exists inside the store
-func (s *Etcd) Exists(key string) (bool, error) {
-	_, err := s.Get(key)
+func (s *Etcd) Exists(key string, opts *store.ReadOptions) (bool, error) {
+	_, err := s.Get(key, opts)
 	if err != nil {
 		if err == store.ErrKeyNotFound {
 			return false, nil
@@ -221,21 +230,21 @@ func (s *Etcd) Exists(key string) (bool, error) {
 // on errors. Upon creation, the current value will first
 // be sent to the channel. Providing a non-nil stopCh can
 // be used to stop watching.
-func (s *Etcd) Watch(key string, stopCh <-chan struct{}) (<-chan *store.KVPair, error) {
-	opts := &etcd.WatcherOptions{Recursive: false}
-	watcher := s.client.Watcher(s.normalize(key), opts)
+func (s *Etcd) Watch(key string, stopCh <-chan struct{}, opts *store.ReadOptions) (<-chan *store.KVPair, error) {
+	wopts := &etcd.WatcherOptions{Recursive: false}
+	watcher := s.client.Watcher(s.normalize(key), wopts)
 
 	// watchCh is sending back events to the caller
 	watchCh := make(chan *store.KVPair)
 
+	// Get the current value
+	pair, err := s.Get(key, opts)
+	if err != nil {
+		return nil, err
+	}
+
 	go func() {
 		defer close(watchCh)
-
-		// Get the current value
-		pair, err := s.Get(key)
-		if err != nil {
-			return
-		}
 
 		// Push the current value through the channel.
 		watchCh <- pair
@@ -270,21 +279,21 @@ func (s *Etcd) Watch(key string, stopCh <-chan struct{}) (<-chan *store.KVPair, 
 // on errors. Upon creating a watch, the current childs values
 // will be sent to the channel. Providing a non-nil stopCh can
 // be used to stop watching.
-func (s *Etcd) WatchTree(directory string, stopCh <-chan struct{}) (<-chan []*store.KVPair, error) {
+func (s *Etcd) WatchTree(directory string, stopCh <-chan struct{}, opts *store.ReadOptions) (<-chan []*store.KVPair, error) {
 	watchOpts := &etcd.WatcherOptions{Recursive: true}
 	watcher := s.client.Watcher(s.normalize(directory), watchOpts)
 
 	// watchCh is sending back events to the caller
 	watchCh := make(chan []*store.KVPair)
 
+	// List current children
+	list, err := s.List(directory, opts)
+	if err != nil {
+		return nil, err
+	}
+
 	go func() {
 		defer close(watchCh)
-
-		// Get child values
-		list, err := s.List(directory)
-		if err != nil {
-			return
-		}
 
 		// Push the current value through the channel.
 		watchCh <- list
@@ -303,7 +312,7 @@ func (s *Etcd) WatchTree(directory string, stopCh <-chan struct{}) (<-chan []*st
 				return
 			}
 
-			list, err = s.List(directory)
+			list, err = s.List(directory, opts)
 			if err != nil {
 				return
 			}
@@ -401,11 +410,16 @@ func (s *Etcd) AtomicDelete(key string, previous *store.KVPair) (bool, error) {
 }
 
 // List child nodes of a given directory
-func (s *Etcd) List(directory string) ([]*store.KVPair, error) {
+func (s *Etcd) List(directory string, opts *store.ReadOptions) ([]*store.KVPair, error) {
 	getOpts := &etcd.GetOptions{
 		Quorum:    true,
 		Recursive: true,
 		Sort:      true,
+	}
+
+	// Get options
+	if opts != nil {
+		getOpts.Quorum = opts.Consistent
 	}
 
 	resp, err := s.client.Get(context.Background(), s.normalize(directory), getOpts)
@@ -418,6 +432,26 @@ func (s *Etcd) List(directory string) ([]*store.KVPair, error) {
 
 	kv := []*store.KVPair{}
 	for _, n := range resp.Node.Nodes {
+		if n.Key == directory {
+			continue
+		}
+
+		// Etcd v2 seems to stop listing child keys at directories even
+		// with the "Recursive" option. If the child is a directory,
+		// we call `List` recursively to go through the whole set.
+		if n.Dir {
+			pairs, err := s.List(n.Key, opts)
+			if err != nil {
+				return nil, err
+			}
+			kv = append(kv, pairs...)
+		}
+
+		// Filter out etcd mutex side keys with `___lock` suffix
+		if strings.Contains(string(n.Key), lockSuffix) {
+			continue
+		}
+
 		kv = append(kv, &store.KVPair{
 			Key:       n.Key,
 			Value:     []byte(n.Value),
@@ -464,7 +498,7 @@ func (s *Etcd) NewLock(key string, options *store.LockOptions) (lock store.Locke
 	lock = &etcdLock{
 		client:    s.client,
 		stopRenew: renewCh,
-		mutexKey:  s.normalize(key + "_lock"),
+		mutexKey:  s.normalize(key + lockSuffix),
 		writeKey:  s.normalize(key),
 		value:     value,
 		ttl:       ttl,

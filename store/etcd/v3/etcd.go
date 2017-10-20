@@ -16,6 +16,7 @@ import (
 const (
 	defaultLockTTL     = 20 * time.Second
 	etcdDefaultTimeout = 5 * time.Second
+	lockSuffix         = "___lock"
 )
 
 // EtcdV3 is the receiver type for the
@@ -107,9 +108,17 @@ func (s *EtcdV3) normalize(key string) string {
 
 // Get the value at "key", returns the last modified
 // index to use in conjunction to Atomic calls
-func (s *EtcdV3) Get(key string) (pair *store.KVPair, err error) {
+func (s *EtcdV3) Get(key string, opts *store.ReadOptions) (pair *store.KVPair, err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), etcdDefaultTimeout)
-	result, err := s.client.KV.Get(ctx, s.normalize(key), etcd.WithSerializable())
+
+	var result *etcd.GetResponse
+
+	if opts != nil && !opts.Consistent {
+		result, err = s.client.KV.Get(ctx, s.normalize(key), etcd.WithSerializable())
+	} else {
+		result, err = s.client.KV.Get(ctx, s.normalize(key))
+	}
+
 	cancel()
 
 	if err != nil {
@@ -138,16 +147,14 @@ func (s *EtcdV3) Put(key string, value []byte, opts *store.WriteOptions) (err er
 	ctx, cancel := context.WithTimeout(context.Background(), etcdDefaultTimeout)
 	pr := s.client.Txn(ctx)
 
-	if opts != nil {
-		if opts.TTL > 0 {
-			lease := etcd.NewLease(s.client)
-			resp, err := lease.Grant(context.Background(), int64(opts.TTL/time.Second))
-			if err != nil {
-				cancel()
-				return err
-			}
-			pr.Then(etcd.OpPut(key, string(value), etcd.WithLease(resp.ID)))
+	if opts != nil && opts.TTL > 0 {
+		lease := etcd.NewLease(s.client)
+		resp, err := lease.Grant(context.Background(), int64(opts.TTL/time.Second))
+		if err != nil {
+			cancel()
+			return err
 		}
+		pr.Then(etcd.OpPut(key, string(value), etcd.WithLease(resp.ID)))
 	} else {
 		pr.Then(etcd.OpPut(key, string(value)))
 	}
@@ -171,8 +178,8 @@ func (s *EtcdV3) Delete(key string) error {
 }
 
 // Exists checks if the key exists inside the store
-func (s *EtcdV3) Exists(key string) (bool, error) {
-	_, err := s.Get(key)
+func (s *EtcdV3) Exists(key string, opts *store.ReadOptions) (bool, error) {
+	_, err := s.Get(key, opts)
 	if err != nil {
 		if err == store.ErrKeyNotFound {
 			return false, nil
@@ -187,14 +194,14 @@ func (s *EtcdV3) Exists(key string) (bool, error) {
 // on errors. Upon creation, the current value will first
 // be sent to the channel. Providing a non-nil stopCh can
 // be used to stop watching.
-func (s *EtcdV3) Watch(key string, stopCh <-chan struct{}) (<-chan *store.KVPair, error) {
+func (s *EtcdV3) Watch(key string, stopCh <-chan struct{}, opts *store.ReadOptions) (<-chan *store.KVPair, error) {
 	wc := etcd.NewWatcher(s.client)
 
 	// respCh is sending back events to the caller
 	respCh := make(chan *store.KVPair)
 
 	// Get the current value
-	pair, err := s.Get(key)
+	pair, err := s.Get(key, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -234,14 +241,14 @@ func (s *EtcdV3) Watch(key string, stopCh <-chan struct{}) (<-chan *store.KVPair
 // on errors. Upon creating a watch, the current childs values
 // will be sent to the channel. Providing a non-nil stopCh can
 // be used to stop watching.
-func (s *EtcdV3) WatchTree(directory string, stopCh <-chan struct{}) (<-chan []*store.KVPair, error) {
+func (s *EtcdV3) WatchTree(directory string, stopCh <-chan struct{}, opts *store.ReadOptions) (<-chan []*store.KVPair, error) {
 	wc := etcd.NewWatcher(s.client)
 
 	// respCh is sending back events to the caller
 	respCh := make(chan []*store.KVPair)
 
 	// Get the current value
-	rev, pairs, err := s.list(directory)
+	rev, pairs, err := s.list(directory, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -301,16 +308,14 @@ func (s *EtcdV3) AtomicPut(key string, value []byte, previous *store.KVPair, opt
 	pr := s.client.Txn(ctx).If(cmp)
 
 	// We set the TTL if given
-	if opts != nil {
-		if opts.TTL > 0 {
-			lease := etcd.NewLease(s.client)
-			resp, err := lease.Grant(context.Background(), int64(opts.TTL/time.Second))
-			if err != nil {
-				cancel()
-				return false, nil, err
-			}
-			pr.Then(etcd.OpPut(key, string(value), etcd.WithLease(resp.ID)))
+	if opts != nil && opts.TTL > 0 {
+		lease := etcd.NewLease(s.client)
+		resp, err := lease.Grant(context.Background(), int64(opts.TTL/time.Second))
+		if err != nil {
+			cancel()
+			return false, nil, err
 		}
+		pr.Then(etcd.OpPut(key, string(value), etcd.WithLease(resp.ID)))
 	} else {
 		pr.Then(etcd.OpPut(key, string(value)))
 	}
@@ -371,8 +376,8 @@ func (s *EtcdV3) AtomicDelete(key string, previous *store.KVPair) (bool, error) 
 }
 
 // List child nodes of a given directory
-func (s *EtcdV3) List(directory string) ([]*store.KVPair, error) {
-	_, kv, err := s.list(directory)
+func (s *EtcdV3) List(directory string, opts *store.ReadOptions) ([]*store.KVPair, error) {
+	_, kv, err := s.list(directory, opts)
 	return kv, err
 }
 
@@ -424,7 +429,8 @@ func (s *EtcdV3) NewLock(key string, options *store.LockOptions) (lock store.Loc
 	// a suffix (such as "_lock") and represents the mutex. Thus we have a pair
 	// composed of the key to protect with a lock: "/key", and a side key that
 	// acts as the lock: "/key_lock"
-	mutexKey := s.normalize(key + "_lock")
+	mutexKey := s.normalize(key + lockSuffix)
+	writeKey := s.normalize(key)
 
 	// Create lock object
 	lock = &etcdLock{
@@ -432,7 +438,7 @@ func (s *EtcdV3) NewLock(key string, options *store.LockOptions) (lock store.Loc
 		mutex:    concurrency.NewMutex(session, mutexKey),
 		session:  session,
 		mutexKey: mutexKey,
-		writeKey: s.normalize(key),
+		writeKey: writeKey,
 		value:    value,
 		ttl:      ttl,
 	}
@@ -483,10 +489,20 @@ func (s *EtcdV3) Close() {
 }
 
 // list child nodes of a given directory and return revision number
-func (s *EtcdV3) list(directory string) (int64, []*store.KVPair, error) {
+func (s *EtcdV3) list(directory string, opts *store.ReadOptions) (int64, []*store.KVPair, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), etcdDefaultTimeout)
-	resp, err := s.client.KV.Get(ctx, s.normalize(directory), etcd.WithPrefix(), etcd.WithSort(etcd.SortByKey, etcd.SortDescend))
+
+	var resp *etcd.GetResponse
+	var err error
+
+	if opts != nil && !opts.Consistent {
+		resp, err = s.client.KV.Get(ctx, s.normalize(directory), etcd.WithSerializable(), etcd.WithPrefix(), etcd.WithSort(etcd.SortByKey, etcd.SortDescend))
+	} else {
+		resp, err = s.client.KV.Get(ctx, s.normalize(directory), etcd.WithPrefix(), etcd.WithSort(etcd.SortByKey, etcd.SortDescend))
+	}
+
 	cancel()
+
 	if err != nil {
 		return 0, nil, err
 	}
@@ -498,6 +514,15 @@ func (s *EtcdV3) list(directory string) (int64, []*store.KVPair, error) {
 	kv := []*store.KVPair{}
 
 	for _, n := range resp.Kvs {
+		if string(n.Key) == directory {
+			continue
+		}
+
+		// Filter out etcd mutex side keys with `___lock` suffix
+		if strings.Contains(string(n.Key), lockSuffix) {
+			continue
+		}
+
 		kv = append(kv, &store.KVPair{
 			Key:       string(n.Key),
 			Value:     []byte(n.Value),

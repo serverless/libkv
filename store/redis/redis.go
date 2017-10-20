@@ -113,7 +113,7 @@ func (r *Redis) setTTL(key string, val *store.KVPair, ttl time.Duration) error {
 }
 
 // Get a value given its key
-func (r *Redis) Get(key string) (*store.KVPair, error) {
+func (r *Redis) Get(key string, opts *store.ReadOptions) (*store.KVPair, error) {
 	return r.get(normalize(key))
 }
 
@@ -138,14 +138,14 @@ func (r *Redis) Delete(key string) error {
 }
 
 // Exists verify if a Key exists in the store
-func (r *Redis) Exists(key string) (bool, error) {
+func (r *Redis) Exists(key string, opts *store.ReadOptions) (bool, error) {
 	return r.client.Exists(normalize(key)).Result()
 }
 
 // Watch for changes on a key
 // glitch: we use notified-then-retrieve to retrieve *store.KVPair.
 // so the responses may sometimes inaccurate
-func (r *Redis) Watch(key string, stopCh <-chan struct{}) (<-chan *store.KVPair, error) {
+func (r *Redis) Watch(key string, stopCh <-chan struct{}, opts *store.ReadOptions) (<-chan *store.KVPair, error) {
 	watchCh := make(chan *store.KVPair)
 	nKey := normalize(key)
 
@@ -269,7 +269,7 @@ func (s *subscribe) receiveLoop(msgCh chan *redis.Message, stopCh <-chan struct{
 
 // WatchTree watches for changes on child nodes under
 // a given directory
-func (r *Redis) WatchTree(directory string, stopCh <-chan struct{}) (<-chan []*store.KVPair, error) {
+func (r *Redis) WatchTree(directory string, stopCh <-chan struct{}, opts *store.ReadOptions) (<-chan []*store.KVPair, error) {
 	watchCh := make(chan []*store.KVPair)
 	nKey := normalize(directory)
 
@@ -353,7 +353,7 @@ func (l *redisLock) Lock(stopCh chan struct{}) (<-chan struct{}, error) {
 	}
 
 	// wait for changes on the key
-	watch, err := l.redis.Watch(l.key, stopCh)
+	watch, err := l.redis.Watch(l.key, stopCh, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -444,7 +444,7 @@ func (l *redisLock) Unlock() error {
 }
 
 // List the content of a given prefix
-func (r *Redis) List(directory string) ([]*store.KVPair, error) {
+func (r *Redis) List(directory string, opts *store.ReadOptions) ([]*store.KVPair, error) {
 	return r.list(normalize(directory))
 }
 
@@ -457,7 +457,7 @@ func (r *Redis) list(directory string) ([]*store.KVPair, error) {
 		return nil, err
 	}
 	// TODO: need to handle when #key is too large
-	return r.mget(allKeys...)
+	return r.mget(directory, allKeys...)
 }
 
 func (r *Redis) keys(regex string) ([]string, error) {
@@ -489,13 +489,13 @@ func (r *Redis) keys(regex string) ([]string, error) {
 }
 
 // mget values given their keys
-func (r *Redis) mget(keys ...string) ([]*store.KVPair, error) {
+func (r *Redis) mget(directory string, keys ...string) ([]*store.KVPair, error) {
 	replies, err := r.client.MGet(keys...).Result()
 	if err != nil {
 		return nil, err
 	}
 
-	var pairs []*store.KVPair
+	pairs := []*store.KVPair{}
 	for _, reply := range replies {
 		var sreply string
 		if _, ok := reply.(string); ok {
@@ -510,7 +510,9 @@ func (r *Redis) mget(keys ...string) ([]*store.KVPair, error) {
 		if err := r.codec.decode(sreply, newkv); err != nil {
 			return nil, err
 		}
-		pairs = append(pairs, newkv)
+		if normalize(newkv.Key) != directory {
+			pairs = append(pairs, newkv)
+		}
 	}
 	return pairs, nil
 }
